@@ -454,7 +454,13 @@ class BillingService:
     def _refund_unused(
         self, account_id: str, plan_code: str, effective: date, reason_to: str | None
     ) -> None:
-        """Refund the unused days of ``plan_code`` in the current period."""
+        """Refund the unused days of ``plan_code`` in the current period.
+
+        The automatic refund is clamped to what was actually prepaid in
+        this period (charges minus earlier credits).  A segment carried
+        over from a previous period was never prepaid for the current
+        period, so the refund there is simply zero — not an error.
+        """
         plan = get_plan(plan_code)
         if plan is None or plan.base_fee <= 0:
             return
@@ -462,9 +468,10 @@ class BillingService:
         period_days = days_in_period(effective)
         unused_days = (period_end - effective).days + 1
         amount = prorate(plan.base_fee, unused_days, period_days)
+        capacity = self._refundable(account_id, period_start, period_end)
+        amount = min(amount, capacity)
         if amount <= 0:
             return
-        self._check_refund_capacity(account_id, period_start, period_end, amount)
         verb = "plan_change_refund" if reason_to else "cancel_refund"
         to_part = f"->{reason_to}" if reason_to else ""
         self._storage.append_credit(
@@ -473,6 +480,17 @@ class BillingService:
                 reason=f"{verb}:{plan_code}{to_part}", amount=amount, created_at=effective
             ),
         )
+
+    def _refundable(self, account_id: str, period_start: date, period_end: date) -> Decimal:
+        charged = sum(
+            (c.amount for c in self._storage.charges_for_period(account_id, period_start, period_end)),
+            _ZERO,
+        )
+        credited = sum(
+            (c.amount for c in self._storage.credits_for_period(account_id, period_start, period_end)),
+            _ZERO,
+        )
+        return charged - credited
 
     def _check_refund_capacity(
         self, account_id: str, period_start: date, period_end: date, amount: Decimal
