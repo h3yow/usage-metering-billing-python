@@ -7,6 +7,7 @@ Layout under the configured directory::
     rejections.json    -> {account_id: [rejection, ...]}
     subscriptions.json -> {account_id: subscription}
     bills.json         -> {account_id: {period_key: bill}}
+    charges.json       -> {account_id: [base-fee charge, ...]}
     credits.json       -> {account_id: [credit, ...]}
 
 Concurrency
@@ -231,6 +232,51 @@ class Storage:
                 status=SubscriptionStatus(raw["status"]),
                 segments=[self._segment_from_dict(s) for s in raw["segments"]],
             )
+
+    # ------------------------------------------------------------------
+    # charges (prepaid base-fee ledger)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _base_fee_line_to_dict(line: BaseFeeLineItem) -> dict:
+        return {
+            "plan_code": line.plan_code,
+            "start": line.start.isoformat(),
+            "end": line.end.isoformat(),
+            "days_active": line.days_active,
+            "period_days": line.period_days,
+            "monthly_fee": str(line.monthly_fee),
+            "amount": str(line.amount),
+        }
+
+    @staticmethod
+    def _base_fee_line_from_dict(raw: dict) -> BaseFeeLineItem:
+        return BaseFeeLineItem(
+            plan_code=raw["plan_code"],
+            start=_date(raw["start"]),
+            end=_date(raw["end"]),
+            days_active=raw["days_active"],
+            period_days=raw["period_days"],
+            monthly_fee=Decimal(raw["monthly_fee"]),
+            amount=Decimal(raw["amount"]),
+        )
+
+    def append_charge(self, account_id: str, line: BaseFeeLineItem) -> None:
+        """Record a prepaid base-fee charge for a plan segment."""
+        with self._lock:
+            charges = self._load("charges")
+            charges.setdefault(account_id, []).append(self._base_fee_line_to_dict(line))
+            self._write("charges", charges)
+
+    def charges_for_period(
+        self, account_id: str, period_start: date, period_end: date
+    ) -> list[BaseFeeLineItem]:
+        with self._lock:
+            result = []
+            for raw in self._load("charges").get(account_id, []):
+                line = self._base_fee_line_from_dict(raw)
+                if period_start <= line.start <= period_end:
+                    result.append(line)
+            return result
 
     # ------------------------------------------------------------------
     # bills

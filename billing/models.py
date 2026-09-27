@@ -84,13 +84,13 @@ class SubscriptionStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
-@dataclass(frozen=True)
+@dataclass
 class PlanSegment:
     """One contiguous slice of a subscription that uses a given plan.
 
     Segments are half-open: [start, end); ``end=None`` means the segment
-    runs to the end of the current billing period (or until another
-    segment replaces it).
+    is still open.  ``end`` is set when the segment is closed by a plan
+    change or cancellation, hence the class is mutable.
     """
 
     plan_code: str
