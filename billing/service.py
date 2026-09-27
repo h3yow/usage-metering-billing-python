@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 from billing.errors import LifecycleError, ReasonCode, ValidationError
@@ -35,10 +35,11 @@ from billing.models import (
     Subscription,
     SubscriptionStatus,
     UsageEvent,
+    UsageLineItem,
 )
 from billing.periods import days_in_period, period_key, period_of
 from billing.plans import get_plan
-from billing.pricing import prorate
+from billing.pricing import price_marginal, prorate
 from billing.storage import Storage
 
 logger = logging.getLogger("billing.service")
@@ -54,6 +55,25 @@ def _plan_at(subscription: Subscription | None, day: date) -> str | None:
         if segment.start <= day and (segment.end is None or day < segment.end):
             return segment.plan_code
     return None
+
+
+def _segment_index_at(subscription: Subscription | None, day: date) -> int | None:
+    """Index of the segment covering ``day`` (half-open [start, end))."""
+    if subscription is None:
+        return None
+    for index, segment in enumerate(subscription.segments):
+        if segment.start <= day and (segment.end is None or day < segment.end):
+            return index
+    return None
+
+
+def _segment_days_in_period(segment: PlanSegment, period_start: date, period_end: date) -> int:
+    """Number of days a segment is active inside a closed period."""
+    lo = max(segment.start, period_start)
+    # An open segment intersecting a closed period ends at the period end.
+    seg_end = segment.end or (period_end + timedelta(days=1))
+    hi = min(seg_end, period_end + timedelta(days=1))
+    return max((hi - lo).days, 0)
 
 
 class BillingService:
@@ -249,8 +269,121 @@ class BillingService:
 
         Closing is idempotent: an existing bill is returned unchanged, so
         history is never rewritten by later changes.
+
+        Usage pricing within a period
+        -----------------------------
+        Events are priced against the plan segment in force at their
+        occurrence time (out-of-order arrival is handled because events
+        are sorted by ``(occurred_at, event_id)``).  A metric's free
+        allowance for a segment is prorated to the segment's days inside
+        the period; graduated tiers are shared across the whole segment
+        via marginal pricing, so line items sum exactly to the aggregate
+        tiered charge.
         """
-        raise NotImplementedError
+        day = period or self._clock()
+        period_start, period_end = period_of(day)
+        key = period_key(day)
+        with self._storage.lock():
+            self._require_account(account_id)
+            existing = self._storage.get_bill(account_id, key)
+            if existing is not None:
+                logger.info(
+                    "period close idempotent",
+                    extra={"account_id": account_id, "period": key},
+                )
+                return existing
+
+            sub = self._storage.get_subscription(account_id)
+            period_days = days_in_period(day)
+            events = sorted(
+                self._storage.events_for_period(account_id, period_start, period_end),
+                key=lambda e: (e.occurred_at, e.event_id),
+            )
+
+            usage_lines: list = []
+            # consumed[segment_index][metric] = total quantity seen so far
+            consumed: dict[int, dict[str, Decimal]] = {}
+            for event in events:
+                seg_index = _segment_index_at(sub, event.occurred_at)
+                if seg_index is None:
+                    # Should never happen: events without a covering plan are
+                    # rejected at ingestion.  Skip defensively rather than
+                    # corrupting the bill.
+                    continue
+                plan_code = sub.segments[seg_index].plan_code
+                plan = get_plan(plan_code)
+                price = plan.price_for(event.metric) if plan else None
+                if price is None:
+                    continue
+
+                active_days = _segment_days_in_period(
+                    sub.segments[seg_index], period_start, period_end
+                )
+                allowance = (
+                    price.free_allowance * Decimal(active_days) / Decimal(period_days)
+                ).quantize(Decimal("0.000001"))
+                prior = consumed.setdefault(seg_index, {}).get(event.metric, _ZERO)
+
+                free_portion, charged_portion, tiers = price_marginal(
+                    price, event.quantity, allowance, prior
+                )
+                consumed[seg_index][event.metric] = prior + event.quantity
+                amount = sum((t.amount for t in tiers), _ZERO)
+
+                usage_lines.append(
+                    UsageLineItem(
+                        event_id=event.event_id,
+                        metric=event.metric,
+                        occurred_at=event.occurred_at,
+                        plan_code=plan_code,
+                        quantity=event.quantity,
+                        free_portion=free_portion,
+                        charged_portion=charged_portion,
+                        tier_breakdown=tiers,
+                        amount=amount,
+                    )
+                )
+
+            base_fee_lines = sorted(
+                self._storage.charges_for_period(account_id, period_start, period_end),
+                key=lambda c: (c.start, c.plan_code),
+            )
+            credits = sorted(
+                self._storage.credits_for_period(account_id, period_start, period_end),
+                key=lambda c: (c.created_at, c.reason),
+            )
+
+            total_base_fee = sum((c.amount for c in base_fee_lines), _ZERO)
+            total_usage = sum((c.amount for c in usage_lines), _ZERO)
+            total_credits = sum((c.amount for c in credits), _ZERO)
+            total = total_base_fee + total_usage - total_credits
+
+            bill = Bill(
+                account_id=account_id,
+                period_start=period_start,
+                period_end=period_end,
+                base_fee_lines=base_fee_lines,
+                usage_lines=usage_lines,
+                credits=credits,
+                total_base_fee=total_base_fee,
+                total_usage=total_usage,
+                total_credits=total_credits,
+                total=total,
+                generated_at=self._clock(),
+            )
+            self._storage.save_bill(bill)
+            logger.info(
+                "period closed",
+                extra={
+                    "account_id": account_id,
+                    "period": key,
+                    "base_fee": str(total_base_fee),
+                    "usage": str(total_usage),
+                    "credits": str(total_credits),
+                    "total": str(total),
+                },
+            )
+            return bill
 
     def get_bill(self, account_id: str, period: str) -> Bill:
         bill = self._storage.get_bill(account_id, period)
